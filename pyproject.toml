@@ -1,0 +1,24 @@
+[project]
+name = "hyperfunc"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "trulite", email = "satya@bluecopa.com" }
+]
+requires-python = ">=3.10"
+dependencies = [
+    "gepa>=0.0.22",
+    "pydantic>=2.12.4",
+    "torch>=2.9.1",
+]
+
+[build-system]
+requires = ["uv_build>=0.9.11,<0.10.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.1",
+    "jax>=0.4.0",
+]
