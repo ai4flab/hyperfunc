@@ -1,39 +1,159 @@
 hyperfunc
 =========
 
-Hyperfunc is a small library for tuning compound AI systems.
+Hyperfunc is a small library for training compound AI systems, not just individual models.
 
-Instead of tuning a single prompt or a single model call, you treat a whole graph of functions as one system and optimise its knobs together: prompts, sampling parameters, adapter scales, and whatever else you expose as hyperparameters.
+Most ML tooling assumes you can backpropagate gradients through the whole stack. In practice, real systems look very different: they are graphs of model calls, tools, databases, and control flow. Large parts of that graph are not differentiable and often not even visible (closed‑source APIs, external services). You still want those pieces to get better from data, but you cannot run standard backprop through them.
 
 
-Motivation: tuning compound AI systems
+Table of contents
+-----------------
+
+- [hyperfunc](#hyperfunc)
+  - [Table of contents](#table-of-contents)
+  - [Motivation: why backprop is not enough](#motivation-why-backprop-is-not-enough)
+  - [ES and Eggroll: tuning without backprop](#es-and-eggroll-tuning-without-backprop)
+  - [DSPy and GEPA: tuning prompts in compound systems](#dspy-and-gepa-tuning-prompts-in-compound-systems)
+  - [HyperSystem: combining ES and prompt optimisation](#hypersystem-combining-es-and-prompt-optimisation)
+  - [Ablations and sensitivity](#ablations-and-sensitivity)
+  - [Caveats and limits](#caveats-and-limits)
+  - [Core idea: the HyperSystem](#core-idea-the-hypersystem)
+  - [What you can do with Hyperfunc](#what-you-can-do-with-hyperfunc)
+  - [Quick tour of the API](#quick-tour-of-the-api)
+  - [Minimal example](#minimal-example)
+  - [Example: tuning an extraction function](#example-tuning-an-extraction-function)
+  - [Prompt optimisation with GEPA](#prompt-optimisation-with-gepa)
+  - [How TorchEggrollES works (at a glance)](#how-torcheggrolles-works-at-a-glance)
+  - [Testing and development](#testing-and-development)
+  - [Status](#status)
+
+
+Motivation: why backprop is not enough
 --------------------------------------
 
-Real applications are not a single `llm(prompt)`. They are:
+A realistic “agent” or application typically includes:
 
-- multiple functions that call different models or tools
-- retrieval, routing, and control flow in the middle
-- adapters, LoRA blocks, and post‑processing logic
+- calls to large LMs behind an API
+- small local models (vision, rerankers, classifiers)
+- retrieval, routing, and branching logic
+- adapters and LoRA blocks
+- parsing, validation, and “if this then that” heuristics
 
-Each of these pieces has its own knobs:
+Some of these parts expose weights, some only expose knobs:
 
-- prompt wording and structure
-- model choice
-- temperature, top‑p, top‑k, max tokens
-- penalties, thresholds, retry logic
-- adapter / LoRA scales, gating, dropout
+- prompt text
+- sampling parameters (temperature, top‑p, top‑k, max tokens)
+- thresholds, penalties, retry counts
+- adapter scales, dropout, gating
 
-Manually tuning these is painful:
+You can backprop inside your own models, but you cannot backprop through:
 
-- you change one prompt and silently break another part
-- you tune one function in isolation and ignore system‑level metrics
-- grid search over all parameters explodes combinatorially
+- the external LLM API
+- the control flow and routing logic
+- non‑differentiable metrics (human feedback, discrete checks, business KPIs)
 
-Hyperfunc gives you a single place to:
+If you want the entire system to improve on an end‑to‑end metric, you need something that does not rely on gradients.
 
-- declare the knobs you care about
-- define a metric over real examples
-- optimise prompts and hyperparameters jointly at the system level
+
+ES and Eggroll: tuning without backprop
+----------------------------------------
+
+Evolution Strategies (ES) is a classic answer here:
+
+- treat the whole system as a black box
+- perturb parameters with noise
+- evaluate a scalar score
+- move parameters in the direction of higher scores
+
+ES does not need gradients or differentiability. It only needs a way to sample parameter settings and score them. The problem is that naive ES gets expensive and noisy as parameter counts grow.
+
+Eggroll (Hyperscale’s EggrollES) is a more efficient flavour of ES. It uses low‑rank noise for large 2D parameters (e.g. matrices), which:
+
+- reduces variance in gradient estimates
+- cuts the cost of exploring high‑dimensional parameter spaces
+
+This makes it more realistic to tune meaningful parameter vectors (hyperparameters, adapter weights, small heads) without backprop and without blowing up compute.
+
+
+DSPy and GEPA: tuning prompts in compound systems
+--------------------------------------------------
+
+In parallel, there is a line of work that treats compound systems as programs whose main knobs are prompts:
+
+- DSPy lets you describe a pipeline as Python functions and automatically tune prompts (“teleprompting”) using supervised data and metrics.
+- GEPA provides a generic prompt optimisation engine that mutates and reflects on prompts to improve performance.
+
+These tools focus on prompt text as the primary control surface. They usually assume the model weights and most hyperparameters stay fixed or are hand‑tuned.
+
+
+HyperSystem: combining ES and prompt optimisation
+-------------------------------------------------
+
+Hyperfunc’s HyperSystem ties these two ideas together:
+
+- prompt optimisation (DSPy/GEPA style) for text knobs
+- ES/Eggroll‑style optimisation for numeric knobs
+
+You model your system as a set of Python functions that call LLMs, small models, tools, or anything else. For each function you can:
+
+- expose a docstring prompt
+- expose a structured hyperparameter object (sampling settings, adapter meta‑parameters, etc.)
+
+**HyperSystem:**
+
+- collects all numeric knobs into a single parameter vector
+- tracks exactly which slice of that vector belongs to which function
+- optionally lets GEPA optimise docstring prompts
+- uses a system‑level metric over input/output examples as the training signal
+
+You give it supervised examples:
+
+- inputs that flow through the whole system
+- desired outputs or scores
+- a metric function that turns predictions and targets into a scalar
+
+HyperSystem then runs a training loop that nudges both prompts and numeric hyperparameters to improve that scalar, even though the system as a whole is non‑differentiable and may involve external APIs.
+
+
+Ablations and sensitivity
+-------------------------
+
+Because HyperSystem knows which hyperparameters belong to which function, you can do simple but useful ablations:
+
+- zero out or reset the slice for one function and re‑evaluate the metric
+- freeze a subset of functions while optimising others
+- run ES with a filter that only updates certain groups of knobs
+
+This lets you answer questions like:
+
+- “If I turn off tuning for this adapter, how much does performance drop?”
+- “Is the router’s threshold actually doing work, or is the summariser carrying everything?”
+- “What happens if I lock prompts and only tune numeric parameters, or vice versa?”
+
+The results are not perfect causal attributions, but they give you local sensitivity under your current metric and configuration. That is often enough to decide where to spend optimisation budget and engineering time.
+
+
+Caveats and limits
+------------------
+
+This approach is powerful, but it comes with trade‑offs:
+
+- Sample efficiency and cost:
+  - ES evaluates many noisy variants of the system.
+  - If each evaluation makes multiple LLM calls, the loop can get expensive.
+- Credit assignment:
+  - The optimiser only sees whether the overall metric went up or down.
+  - It does not automatically know which component “caused” the change beyond what your parametrisation exposes.
+- Scale:
+  - ES is suitable for hyperparameter vectors, adapters, and small heads.
+  - It is not a drop‑in replacement for backprop on massive models.
+- Metric design:
+  - You optimise whatever you measure.
+  - Poorly chosen metrics can be gamed or lead to overfitting.
+- Non‑stationarity:
+  - If external APIs or data distributions drift, the optimiser may chase moving targets.
+
+Hyperfunc is meant for developers who understand these caveats and still want a practical way to train the behaviour of a compound system — prompts, small models, and knobs — using supervised examples and a single optimisation loop.
 
 
 Core idea: the HyperSystem
@@ -68,24 +188,6 @@ Hyperfunc will:
 - nudge prompts and hyperparameters to improve the metric
 
 
-Relation to DSPy, GEPA, and Hyperscale Eggroll
-----------------------------------------------
-
-This project stands on a few ideas you may already know:
-
-- DSPy: describing LLM pipelines as Python functions and letting a “teleprompter” tune prompts for a metric
-- GEPA: a library that automates prompt mutation and reflection to improve performance
-- Hyperscale Eggroll: a JAX implementation of an evolution strategies trainer (EggrollES) that can tune model parameters with low‑rank noise
-
-Hyperfunc borrows from all three:
-
-- like DSPy, you write normal Python functions and let the system optimise them
-- it can plug into GEPA to optimise docstring prompts via reflection and mutation
-- it ships `TorchEggrollES`, a PyTorch reimplementation of EggrollES, to tune numeric hyperparameters
-
-Out of the box, the core library only uses evolution strategies for hyperparameters. Prompt optimisation via GEPA is opt‑in and aimed at experimenters who are happy to depend on GEPA and its evolving API.
-
-
 What you can do with Hyperfunc
 ------------------------------
 
@@ -115,7 +217,6 @@ The core pieces live in `hyperfunc`:
 
 - `@hyperfunction`: decorator that wraps a Python function as a `HyperFunction`.
 - `HyperSystem`: connects a set of `HyperFunction`s with a shared hyperparameter vector.
-- `Example`: a single training example for a specific function.
 - `LMParam`: a standard LLM hyperparameter bundle (temperature, top‑p, etc.).
 - `AdapterMeta`: a bundle of adapter‑level knobs.
 - `TorchEggrollSystemOptimizer`: ES‑based optimiser for `HyperModel.hp`.
