@@ -1,5 +1,6 @@
 """Tests for DAG tracing and staged execution."""
 
+import pytest
 import torch
 
 from hyperfunc import (
@@ -11,83 +12,89 @@ from hyperfunc import (
 )
 
 
-def test_trace_captures_call_order():
+@pytest.mark.asyncio
+async def test_trace_captures_call_order():
     """Test that trace_run captures hyperfunction calls in order."""
 
     @hyperfunction()
-    def step_a(x: int) -> int:
+    async def step_a(x: int) -> int:
         return x + 1
 
     @hyperfunction()
-    def step_b(y: int) -> int:
+    async def step_b(y: int) -> int:
         return y * 2
 
     class PipelineSystem(HyperSystem):
-        def run(self, x: int):
-            a_result = step_a(x)
-            b_result = step_b(a_result)
+        async def run(self, x: int):
+            a_result = await step_a(x)
+            b_result = await step_b(a_result)
             return b_result
 
     system = PipelineSystem()
     system.register_hyperfunction(step_a)
     system.register_hyperfunction(step_b)
 
-    trace = system.trace_run({"x": 5})
+    trace = await system.trace_run({"x": 5})
 
     assert len(trace.nodes) == 2
     assert trace.nodes[0].fn_name == "step_a"
     assert trace.nodes[1].fn_name == "step_b"
 
 
-def test_trace_captures_dependencies():
+@pytest.mark.asyncio
+async def test_trace_captures_dependencies():
     """Test that dependencies are correctly detected from data flow."""
 
     @hyperfunction()
-    def step_a(x: int) -> int:
+    async def step_a(x: int) -> int:
         return x + 1
 
     @hyperfunction()
-    def step_b(y: int) -> int:
+    async def step_b(y: int) -> int:
         return y * 2
 
     class PipelineSystem(HyperSystem):
-        def run(self, x: int):
-            a_result = step_a(x)
-            b_result = step_b(a_result)  # b depends on a
+        async def run(self, x: int):
+            a_result = await step_a(x)
+            b_result = await step_b(a_result)  # b depends on a
             return b_result
 
     system = PipelineSystem()
     system.register_hyperfunction(step_a)
     system.register_hyperfunction(step_b)
 
-    trace = system.trace_run({"x": 5})
+    trace = await system.trace_run({"x": 5})
 
     # step_b should depend on step_a (node_id 0)
     assert trace.nodes[1].dependencies == {0}
 
 
-def test_trace_stages_parallel_calls():
+@pytest.mark.asyncio
+async def test_trace_stages_parallel_calls():
     """Test that independent calls are placed in the same stage."""
+    import asyncio
 
     @hyperfunction()
-    def step_a(x: int) -> int:
+    async def step_a(x: int) -> int:
         return x + 1
 
     @hyperfunction()
-    def step_b(x: int) -> int:
+    async def step_b(x: int) -> int:
         return x * 2
 
     @hyperfunction()
-    def step_c(a: int, b: int) -> int:
+    async def step_c(a: int, b: int) -> int:
         return a + b
 
     class ParallelSystem(HyperSystem):
-        def run(self, x: int):
+        async def run(self, x: int):
             # a and b are independent, can run in parallel
-            a_result = step_a(x)
-            b_result = step_b(x)
+            a_result, b_result = await asyncio.gather(
+                step_a(x),
+                step_b(x),
+            )
             # c depends on both
-            c_result = step_c(a_result, b_result)
+            c_result = await step_c(a_result, b_result)
             return c_result
 
     system = ParallelSystem()
@@ -95,7 +102,7 @@ def test_trace_stages_parallel_calls():
     system.register_hyperfunction(step_b)
     system.register_hyperfunction(step_c)
 
-    trace = system.trace_run({"x": 5})
+    trace = await system.trace_run({"x": 5})
 
     stages = trace.to_stages()
 
@@ -109,21 +116,22 @@ def test_trace_stages_parallel_calls():
     assert stages[1][0].fn_name == "step_c"
 
 
-def test_evaluate_with_multi_stage_system():
+@pytest.mark.asyncio
+async def test_evaluate_with_multi_stage_system():
     """Test that evaluate works correctly with multi-stage systems."""
 
     @hyperfunction()
-    def double(x: int) -> int:
+    async def double(x: int) -> int:
         return x * 2
 
     @hyperfunction()
-    def add_one(x: int) -> int:
+    async def add_one(x: int) -> int:
         return x + 1
 
     class ChainedSystem(HyperSystem):
-        def run(self, x: int):
-            doubled = double(x)
-            result = add_one(doubled)
+        async def run(self, x: int):
+            doubled = await double(x)
+            result = await add_one(doubled)
             return result
 
     system = ChainedSystem()
@@ -139,21 +147,22 @@ def test_evaluate_with_multi_stage_system():
     def accuracy(preds, expected):
         return sum(1 for p, e in zip(preds, expected) if p == e) / len(expected)
 
-    score = system.evaluate(examples, accuracy)
+    score = await system.evaluate(examples, accuracy)
     assert score == 1.0  # All correct
 
 
-def test_population_eval_with_hp():
+@pytest.mark.asyncio
+async def test_population_eval_with_hp():
     """Test that population evaluation works with hyperparameters."""
 
     @hyperfunction(hp_type=LMParam, optimize_hparams=True)
-    def scaled_add(x: float, hp: LMParam) -> float:
+    async def scaled_add(x: float, hp: LMParam) -> float:
         # Use temperature as a scaling factor
         return x + hp.temperature
 
     class ScaledSystem(HyperSystem):
-        def run(self, x: float):
-            return scaled_add(x)
+        async def run(self, x: float):
+            return await scaled_add(x)
 
     system = ScaledSystem()
     system.register_hyperfunction(scaled_add)
@@ -180,7 +189,7 @@ def test_population_eval_with_hp():
         hp_c = base.clone()
         hp_c[0] = 1.0
 
-    scores = system.evaluate_population(
+    scores = await system.evaluate_population(
         [
             {"scaled_add": hp_a},
             {"scaled_add": hp_b},

@@ -351,7 +351,7 @@ class ESHybridSystemOptimizer:
 
         return noise * sign
 
-    def optimize(
+    async def optimize(
         self,
         system: HyperSystem,
         train_data: Sequence[Example],
@@ -408,8 +408,8 @@ class ESHybridSystemOptimizer:
                     hp_candidates.append(cand_state)
                     noises.append(noise_state)
 
-                # 2) Evaluate all candidates
-                rewards_list = system.evaluate_population(
+                # 2) Evaluate all candidates (async)
+                rewards_list = await system.evaluate_population(
                     hp_candidates,
                     train_data,
                     metric_fn,

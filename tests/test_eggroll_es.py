@@ -1,5 +1,6 @@
 """Tests for TorchEggrollES with low-rank noise and antithetic sampling."""
 
+import pytest
 import torch
 from torch import nn
 
@@ -195,7 +196,8 @@ def test_param_filter():
     assert not torch.allclose(model.trainable_param, torch.zeros(3))
 
 
-def test_lora_weight_with_system_optimizer():
+@pytest.mark.asyncio
+async def test_lora_weight_with_system_optimizer():
     """Test that LoRAWeight hp_type uses low-rank noise in ESHybridSystemOptimizer."""
 
     # Create a LoRAWeight type for 4x8 matrix with rank=2 noise
@@ -205,14 +207,14 @@ def test_lora_weight_with_system_optimizer():
     target = torch.randn(4, 8) * 0.3
 
     @hyperfunction(hp_type=MyLoRA, optimize_hparams=True)
-    def lora_fn(x: float, hp) -> float:
+    async def lora_fn(x: float, hp) -> float:
         # hp.weight is a 4x8 matrix
         # Return negative Frobenius distance from target
         return -float(((hp.weight - target) ** 2).sum())
 
     class LoRASystem(HyperSystem):
-        def run(self, x: float):
-            return lora_fn(x)
+        async def run(self, x: float):
+            return await lora_fn(x)
 
     system = LoRASystem(
         system_optimizer=ESHybridSystemOptimizer(
@@ -233,11 +235,11 @@ def test_lora_weight_with_system_optimizer():
         # Higher is better (less negative)
         return sum(preds) / len(preds)
 
-    initial_score = system.evaluate(examples, metric_fn)
+    initial_score = await system.evaluate(examples, metric_fn)
 
-    system.optimize(examples, metric_fn)
+    await system.optimize(examples, metric_fn)
 
-    final_score = system.evaluate(examples, metric_fn)
+    final_score = await system.evaluate(examples, metric_fn)
 
     # Should improve
     assert final_score > initial_score

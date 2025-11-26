@@ -1,20 +1,22 @@
+import pytest
 import torch
 from hyperfunc import Example, HyperSystem, LMParam, ESHybridSystemOptimizer, hyperfunction
 
 
-def test_es_optimization():
+@pytest.mark.asyncio
+async def test_es_optimization():
     # Define a function where "temperature" is the target value we want to find
     # Let's say we want temperature to be 0.5
 
     @hyperfunction(hp_type=LMParam, optimize_hparams=True)
-    def target_fn(x: float, hp: LMParam) -> float:
+    async def target_fn(x: float, hp: LMParam) -> float:
         # We return the distance from 0.5
         return -abs(hp.temperature - 0.5)
 
     # Create a custom system that routes inputs to target_fn
     class TestSystem(HyperSystem):
-        def run(self, x: float):
-            return target_fn(x)
+        async def run(self, x: float):
+            return await target_fn(x)
 
     # Data is irrelevant for this dummy function, but required by API
     # New Example format: just inputs (kwargs to run) and expected output
@@ -42,12 +44,12 @@ def test_es_optimization():
         hp[0] = 0.0
         system.set_hp_state({"target_fn": hp})
 
-    initial_score = system.evaluate(train_data, metric_fn)
+    initial_score = await system.evaluate(train_data, metric_fn)
     assert initial_score == -0.5
 
-    system.optimize(train_data, metric_fn)
+    await system.optimize(train_data, metric_fn)
 
-    final_score = system.evaluate(train_data, metric_fn)
+    final_score = await system.evaluate(train_data, metric_fn)
     print(f"Initial: {initial_score}, Final: {final_score}")
 
     # Should have improved

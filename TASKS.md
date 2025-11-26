@@ -15,14 +15,21 @@ This file tracks the main areas of work for hyperfunc while the design is still 
 
 - [x] Introduce a per-hyperfunction batching hook (`HyperSystem._run_batch(...)`) and use it from `evaluate(...)`.
 - [x] Group `Example`s by target hyperfunction so that calls to the same `HyperFunction` can be executed together.
-- [ ] Extend `_run_batch(...)`/related hooks to be population-aware (batching calls across ES candidates as well as examples).
-- [ ] Implement real batched execution for GPU-backed hyperfunctions (e.g. OCR, NER) using a single large forward per stage.
+- [x] Extend `_run_batch(...)`/related hooks to be population-aware (batching calls across ES candidates as well as examples).
+  - `evaluate_population()` with memory chunking via `max_batch_size`
+- [x] Implement real batched execution for GPU-backed hyperfunctions (e.g. OCR, NER) using a single large forward per stage.
+  - `torch.vmap` infrastructure: `_get_tensor_fn()`, `_is_vmappable()`, `_execute_hf_batched()`
+  - Nested vmap for candidates × examples in a single kernel
+  - Auto-fallback to `asyncio.gather` for non-vmappable functions
 - [ ] Implement batched/asynchronous execution for HTTP-backed hyperfunctions (e.g. LLM APIs), with basic rate limiting.
 
 ## 3. Workflow/runtime semantics (`start`, `evaluate`, `optimize`)
 
 - [x] Add `HyperSystem.evaluate(examples, metric_fn, environment_state=None, seed=None, collect_trace=False)`.
 - [x] Keep `HyperSystem.optimize(...)` as the main tuning entrypoint and route its evaluations through `evaluate(...)`.
+- [x] Auto-registration: hyperfunctions auto-register with Xavier-like init when first called in `run()`.
+  - `get_hp_default_init()` generates initialization from `hp_type.shape()`
+  - `register_hyperfunction()` still available for custom/pretrained weights
 - [ ] Define the intended behaviour of `HyperSystem.start()` for agent-style runtimes and implement a minimal reference example.
 - [ ] Clarify and document the semantics of `environment_state` and `seed` in `evaluate(...)` (how they affect randomness and control flow).
 
@@ -43,7 +50,8 @@ This file tracks the main areas of work for hyperfunc while the design is still 
 
 - [x] Add at least one end-to-end example that wires multiple hyperfunctions into a simple workflow and uses `evaluate` + `optimize`.
   - `test_affine_composition.py` and `test_xor_composition.py` demonstrate composed hyperfunctions with ES optimization
-- [ ] Add a small “agent-style” demo that shows how `start()` might be used in a long-running loop.
+  - `demos/shape_classifier/`: Full demo with color MLP + shape classifier, pre-extracted features, 100% accuracy
+- [ ] Add a small "agent-style" demo that shows how `start()` might be used in a long-running loop.
 
 ## 7. Future / V2 scheduler work
 

@@ -11,6 +11,7 @@ XOR truth table:
 This is not linearly separable - requires at least one hidden layer with nonlinearity.
 """
 
+import pytest
 import torch
 from hyperfunc import (
     HyperSystem,
@@ -28,13 +29,13 @@ OutputWeights = LoRAWeight.create(out_dim=1, in_dim=4, noise_rank=2)
 
 
 @hyperfunction(hp_type=HiddenWeights, optimize_hparams=True)
-def hidden_layer(x: torch.Tensor, hp) -> torch.Tensor:
+async def hidden_layer(x: torch.Tensor, hp) -> torch.Tensor:
     """Hidden layer with ReLU activation."""
     return torch.relu(x @ hp.weight.T)
 
 
 @hyperfunction(hp_type=OutputWeights, optimize_hparams=True)
-def output_layer(x: torch.Tensor, hp) -> torch.Tensor:
+async def output_layer(x: torch.Tensor, hp) -> torch.Tensor:
     """Output layer with sigmoid for binary classification."""
     return torch.sigmoid(x @ hp.weight.T)
 
@@ -42,9 +43,9 @@ def output_layer(x: torch.Tensor, hp) -> torch.Tensor:
 class XORSystem(HyperSystem):
     """Two-layer network: hidden(ReLU) -> output(sigmoid)"""
 
-    def run(self, x: torch.Tensor) -> float:
-        hidden = hidden_layer(x)
-        output = output_layer(hidden)
+    async def run(self, x: torch.Tensor) -> float:
+        hidden = await hidden_layer(x)
+        output = await output_layer(hidden)
         return float(output.squeeze())
 
 
@@ -75,7 +76,8 @@ def accuracy_metric(preds, expected):
     return correct / len(preds)
 
 
-def test_xor_composition():
+@pytest.mark.asyncio
+async def test_xor_composition():
     """
     Test that a two-layer network can learn XOR.
     """
@@ -95,16 +97,14 @@ def test_xor_composition():
     system.register_hyperfunction(output_layer, hp_init=torch.randn(1, 4) * 0.5)
 
     # Evaluate before optimization
-    initial_acc = accuracy_metric(
-        [system.run(**ex.inputs) for ex in XOR_EXAMPLES],
-        [ex.expected for ex in XOR_EXAMPLES]
-    )
+    initial_preds = [await system.run(**ex.inputs) for ex in XOR_EXAMPLES]
+    initial_acc = accuracy_metric(initial_preds, [ex.expected for ex in XOR_EXAMPLES])
 
     # Optimize
-    system.optimize(XOR_EXAMPLES, binary_cross_entropy_metric)
+    await system.optimize(XOR_EXAMPLES, binary_cross_entropy_metric)
 
     # Evaluate after optimization
-    final_preds = [system.run(**ex.inputs) for ex in XOR_EXAMPLES]
+    final_preds = [await system.run(**ex.inputs) for ex in XOR_EXAMPLES]
     final_acc = accuracy_metric(final_preds, [ex.expected for ex in XOR_EXAMPLES])
 
     print(f"Initial accuracy: {initial_acc:.2%}")
@@ -117,7 +117,8 @@ def test_xor_composition():
     assert final_acc == 1.0, f"Should achieve 100% accuracy on XOR, got {final_acc:.2%}"
 
 
-def test_single_layer_cannot_solve_xor():
+@pytest.mark.asyncio
+async def test_single_layer_cannot_solve_xor():
     """
     Prove that a single linear layer cannot solve XOR.
     This is the mathematical foundation for why composition matters.
@@ -126,12 +127,12 @@ def test_single_layer_cannot_solve_xor():
     SingleWeights = LoRAWeight.create(out_dim=1, in_dim=2, noise_rank=2)
 
     @hyperfunction(hp_type=SingleWeights, optimize_hparams=True)
-    def single_layer(x: torch.Tensor, hp) -> float:
+    async def single_layer(x: torch.Tensor, hp) -> float:
         return float(torch.sigmoid(x @ hp.weight.T).squeeze())
 
     class SingleLayerSystem(HyperSystem):
-        def run(self, x: torch.Tensor) -> float:
-            return single_layer(x)
+        async def run(self, x: torch.Tensor) -> float:
+            return await single_layer(x)
 
     system = SingleLayerSystem(
         system_optimizer=ESHybridSystemOptimizer(
@@ -146,10 +147,10 @@ def test_single_layer_cannot_solve_xor():
     system.register_hyperfunction(single_layer, hp_init=torch.randn(1, 2) * 0.5)
 
     # Optimize
-    system.optimize(XOR_EXAMPLES, binary_cross_entropy_metric)
+    await system.optimize(XOR_EXAMPLES, binary_cross_entropy_metric)
 
     # Evaluate
-    final_preds = [system.run(**ex.inputs) for ex in XOR_EXAMPLES]
+    final_preds = [await system.run(**ex.inputs) for ex in XOR_EXAMPLES]
     final_acc = accuracy_metric(final_preds, [ex.expected for ex in XOR_EXAMPLES])
 
     print(f"Single layer accuracy: {final_acc:.2%}")

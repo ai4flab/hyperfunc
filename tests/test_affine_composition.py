@@ -8,6 +8,7 @@ Task: Learn to rotate points by 45° then scale by 2x
 - Together: A @ B learns the full rotation+scale transform
 """
 
+import pytest
 import torch
 from hyperfunc import (
     HyperSystem,
@@ -23,13 +24,13 @@ Matrix2x2 = LoRAWeight.create(out_dim=2, in_dim=2, noise_rank=2)
 
 
 @hyperfunction(hp_type=Matrix2x2, optimize_hparams=True)
-def transform_a(x: torch.Tensor, hp) -> torch.Tensor:
+async def transform_a(x: torch.Tensor, hp) -> torch.Tensor:
     """First linear transform (learns rotation-like component)."""
     return x @ hp.weight.T
 
 
 @hyperfunction(hp_type=Matrix2x2, optimize_hparams=True)
-def transform_b(x: torch.Tensor, hp) -> torch.Tensor:
+async def transform_b(x: torch.Tensor, hp) -> torch.Tensor:
     """Second linear transform (learns scale-like component)."""
     return x @ hp.weight.T
 
@@ -37,9 +38,9 @@ def transform_b(x: torch.Tensor, hp) -> torch.Tensor:
 class AffineSystem(HyperSystem):
     """Composes two transforms: output = transform_b(transform_a(x))"""
 
-    def run(self, x: torch.Tensor) -> torch.Tensor:
-        intermediate = transform_a(x)
-        return transform_b(intermediate)
+    async def run(self, x: torch.Tensor) -> torch.Tensor:
+        intermediate = await transform_a(x)
+        return await transform_b(intermediate)
 
 
 def generate_rotation_scale_data(n_examples: int = 100, seed: int = 42):
@@ -90,7 +91,8 @@ def mse_metric(preds, expected):
     return -total_mse / len(preds)
 
 
-def test_affine_composition():
+@pytest.mark.asyncio
+async def test_affine_composition():
     """
     Test that ES can optimize two composed 2x2 matrices to learn
     a rotation+scale transform.
@@ -114,13 +116,13 @@ def test_affine_composition():
     system.register_hyperfunction(transform_b, hp_init=torch.eye(2))
 
     # Evaluate before optimization
-    initial_score = system.evaluate(examples, mse_metric)
+    initial_score = await system.evaluate(examples, mse_metric)
 
     # Optimize
-    system.optimize(examples, mse_metric)
+    await system.optimize(examples, mse_metric)
 
     # Evaluate after optimization
-    final_score = system.evaluate(examples, mse_metric)
+    final_score = await system.evaluate(examples, mse_metric)
 
     # Check improvement
     print(f"Initial MSE: {-initial_score:.4f}")
@@ -143,7 +145,8 @@ def test_affine_composition():
     assert -final_score < 0.1, f"Final MSE should be small, got {-final_score}"
 
 
-def test_single_matrix_cannot_learn():
+@pytest.mark.asyncio
+async def test_single_matrix_cannot_learn():
     """
     Verify that a single 2x2 matrix cannot learn rotation+scale
     as well as the composed system.
@@ -153,12 +156,12 @@ def test_single_matrix_cannot_learn():
     examples, target_matrix = generate_rotation_scale_data(n_examples=50)
 
     @hyperfunction(hp_type=Matrix2x2, optimize_hparams=True)
-    def single_transform(x: torch.Tensor, hp) -> torch.Tensor:
+    async def single_transform(x: torch.Tensor, hp) -> torch.Tensor:
         return x @ hp.weight.T
 
     class SingleSystem(HyperSystem):
-        def run(self, x: torch.Tensor) -> torch.Tensor:
-            return single_transform(x)
+        async def run(self, x: torch.Tensor) -> torch.Tensor:
+            return await single_transform(x)
 
     # Single matrix system
     single_system = SingleSystem(
@@ -184,11 +187,11 @@ def test_single_matrix_cannot_learn():
     composed_system.register_hyperfunction(transform_b, hp_init=torch.eye(2))
 
     # Optimize both
-    single_system.optimize(examples, mse_metric)
-    composed_system.optimize(examples, mse_metric)
+    await single_system.optimize(examples, mse_metric)
+    await composed_system.optimize(examples, mse_metric)
 
-    single_score = single_system.evaluate(examples, mse_metric)
-    composed_score = composed_system.evaluate(examples, mse_metric)
+    single_score = await single_system.evaluate(examples, mse_metric)
+    composed_score = await composed_system.evaluate(examples, mse_metric)
 
     print(f"Single matrix MSE: {-single_score:.4f}")
     print(f"Composed matrices MSE: {-composed_score:.4f}")
