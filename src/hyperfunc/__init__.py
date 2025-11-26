@@ -1,13 +1,20 @@
 from .core import (
     AdapterMeta,
     Example,
+    ExecutionTrace,
     HyperFunction,
     HyperParam,
     HyperSystem,
     LMParam,
+    LoRAWeight,
+    TraceNode,
+    TracedValue,
+    get_hp_noise_rank,
+    get_hp_shape,
     hyperfunction,
+    unwrap_traced,
 )
-from .es import TorchEggrollSystemOptimizer
+from .es import ESHybridSystemOptimizer, TorchEggrollES
 from .prompt import GEPAPromptOptimizer
 
 __all__ = [
@@ -16,8 +23,14 @@ __all__ = [
     "HyperFunction",
     "HyperParam",
     "LMParam",
+    "LoRAWeight",
     "AdapterMeta",
     "Example",
-    "TorchEggrollSystemOptimizer",
+    "ExecutionTrace",
+    "TraceNode",
+    "TracedValue",
+    "unwrap_traced",
+    "ESHybridSystemOptimizer",
+    "TorchEggrollES",
     "GEPAPromptOptimizer",
 ]

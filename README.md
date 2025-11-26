@@ -138,6 +138,10 @@ Caveats and limits
 
 This approach is powerful, but it comes with trade‑offs:
 
+- Control‑flow invariance:
+  - Hyperparameters are assumed to change *behaviour inside calls*, not the call graph itself.
+  - In other words: which hyperfunctions run, in what order, and how many times (loops) should not depend on hp.
+  - If hp starts gating branches or loops, the traced DAG that ES replays becomes invalid and optimisation can behave badly.
 - Sample efficiency and cost:
   - ES evaluates many noisy variants of the system.
   - If each evaluation makes multiple LLM calls, the loop can get expensive.
@@ -156,6 +160,32 @@ This approach is powerful, but it comes with trade‑offs:
 Hyperfunc is meant for developers who understand these caveats and still want a practical way to train the behaviour of a compound system — prompts, small models, and knobs — using supervised examples and a single optimisation loop.
 
 
+Population evaluation and DAG staging
+-------------------------------------
+
+When you move from a single set of hyperparameters to ES over a *population* of candidates, Hyperfunc does not re‑run your Python control flow separately for every candidate. Instead, it:
+
+1. **Traces `run` once per example.**
+   - In evaluation mode you call `HyperSystem.execute(...)` / `evaluate(...)` with tracing enabled.
+   - Every `@hyperfunction` call inside `run` is recorded as a `CallRecord` (plus richer context), including which function was called, for which example, and in what order.
+   - Branches and loops are captured as “this hyperfunction was (or was not) called” and “it was called N times” in the trace.
+2. **Builds a per‑example DAG of hyperfunction calls.**
+   - From the trace, Hyperfunc derives a DAG whose nodes are hyperfunction invocations and whose edges are data dependencies (e.g. OCR → NER → LLM).
+   - Nodes that only depend on raw inputs form the first stage; nodes that depend only on those form the next stage, and so on.
+   - This DAG is assumed to be *independent of hp* for a fixed dataset (see the control‑flow invariance caveat above).
+3. **Stages and batches work in `evaluate_population`.**
+   - `evaluate_population` replays the DAG for many hp candidates at once rather than re‑interpreting the Python control flow:
+     - For each stage and each hyperfunction in that stage, it collects all `(candidate, example)` calls that should run there.
+     - For hyperfunctions marked `local_gpu=True`, these calls are intended to be executed as real batched GPU forwards across the population and examples.
+     - For the rest, calls can be fanned out concurrently (e.g. via a thread pool) across CPU/HTTP work.
+   - Intermediate results are stored per candidate per example and fed forward stage by stage through the DAG.
+4. **Reduces to per‑candidate rewards.**
+   - After the final stage, you have outputs `preds_k[i]` for each candidate `k` and example `i`.
+   - `metric_fn(preds_k, expected)` is applied per candidate to produce ES rewards, which drive the optimiser.
+
+The key point is that the *structure* of execution (the DAG and stages) comes from a single traced run of your `HyperSystem.run` on the dataset, while ES and `evaluate_population` focus on efficiently re‑using that structure across many hp candidates. Hyperparameters are free to change how each node behaves, but not which nodes exist or how they are wired. 
+
+
 Core idea: the HyperSystem
 --------------------------
 
@@ -169,9 +199,9 @@ You decorate them with `@hyperfunction`:
 
 `HyperSystem` owns:
 
-- a single learnable vector `hp` (a `HyperModel`), sliced across your functions
+- a structured set of learnable hp blocks (one 1D tensor per `@hyperfunction`)
 - a prompt optimiser (GEPA‑style, for docstring prompts)
-- a system optimiser (TorchEggrollES, for numeric hyperparameters)
+- a system optimiser (ES / TorchEggrollES‑style, for numeric hyperparameters)
 
 You feed it supervised examples and a metric:
 
@@ -265,9 +295,9 @@ system = HyperSystem(
 with torch.no_grad():
     system.model.hp[0] = 0.0
 
-print("Initial score:", system.eval_on_examples(train_data, metric_fn))
+print("Initial score:", system.evaluate(train_data, metric_fn))
 system.optimize(train_data, metric_fn)
-print("Final score:", system.eval_on_examples(train_data, metric_fn))
+print("Final score:", system.evaluate(train_data, metric_fn))
 ```
 
 In a real system, `score_answer` would call an LLM with `hp.temperature` and friends, and the metric would be something meaningful: accuracy, revenue, latency‑penalised quality, or any custom function over your outputs.
@@ -333,7 +363,7 @@ How TorchEggrollES works (at a glance)
 Hyperfunc wraps this as `TorchEggrollSystemOptimizer`, which:
 
 - focuses ES updates on the `HyperModel.hp` parameter
-- calls your metric through `HyperSystem.eval_on_examples`
+- calls your metric through `HyperSystem.evaluate`
 
 You do not have to think about the ES details to use it, but the behaviour is entirely transparent and implemented in `src/hyperfunc/es.py`.
 

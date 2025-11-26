@@ -13,7 +13,7 @@ class GEPAPromptOptimizer:
     Real GEPA-based prompt optimizer.
 
     Integrates with the `gepa` library to optimize prompts based on feedback
-    from `HyperSystem.eval_on_examples`.
+    from `HyperSystem.evaluate`.
     """
     
     steps: int = 10
@@ -75,7 +75,7 @@ class HyperFunctionGEPAAdapter(GEPAAdapter):
         self.target_hf_name = target_hf_name
         self.train_data = train_data
         self.metric_fn = metric_fn
-        self.hf = system._by_name[target_hf_name]
+        self.hf = system.get_hyperfunction(target_hf_name)
 
     def evaluate(self, prompt: str) -> float:
         """
@@ -87,7 +87,7 @@ class HyperFunctionGEPAAdapter(GEPAAdapter):
         
         try:
             # Run evaluation on the whole system (other parts stay constant)
-            score = self.system.eval_on_examples(self.train_data, self.metric_fn)
+            score = self.system.evaluate(self.train_data, self.metric_fn)
             return score
         finally:
             # Restore original prompt so we don't mess up state for other candidates

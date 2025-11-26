@@ -1,13 +1,6 @@
 import random
 from pydantic import BaseModel
-from hyperfunc import (
-    Example,
-    HyperSystem,
-    LMParam,
-    TorchEggrollSystemOptimizer,
-    GEPAPromptOptimizer,
-    hyperfunction,
-)
+from hyperfunc import Example, HyperSystem, LMParam, ESHybridSystemOptimizer, GEPAPromptOptimizer, hyperfunction
 
 # Mock LLM call for demo purposes
 def mock_llm_call(prompt: str, temperature: float) -> str:
@@ -82,22 +75,24 @@ def run_demo():
             hf.set_prompt(hf.get_prompt() + " Please output valid JSON.")
             
     system = HyperSystem(
-        hyperfunctions=[extract_invoice],
-        prompt_optimizer=MockGEPAPromptOptimizer(), 
-        system_optimizer=TorchEggrollSystemOptimizer(steps=10, lr=0.1),
+        prompt_optimizer=MockGEPAPromptOptimizer(),
+        system_optimizer=ESHybridSystemOptimizer(steps=10, lr=0.1),
     )
+    system.register_hyperfunction(extract_invoice)
 
     # 3. Baseline
-    print("Baseline score:", system.eval_on_examples(train_data, metric_fn))
+    print("Baseline score:", system.evaluate(train_data, metric_fn))
     
     # 4. Optimize
     print("Optimizing...")
     system.optimize(train_data, metric_fn)
     
     # 5. Result
-    print("Final score:", system.eval_on_examples(train_data, metric_fn))
+    print("Final score:", system.evaluate(train_data, metric_fn))
     print("Final Prompt:", extract_invoice.get_prompt())
-    print("Final Params (Temp):", system.model.hp[0].item())
+    state = system.get_hp_state()
+    hp_vec = state["extract_invoice"]
+    print("Final Params (Temp):", hp_vec[0].item())
 
 
 if __name__ == "__main__":
