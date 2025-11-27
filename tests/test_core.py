@@ -8,7 +8,7 @@ def test_lmparam_roundtrip():
     # Basic sanity check for LMParam's torch helpers.
     p = LMParam(temperature=0.5)
     t = p.to_tensor()
-    assert t.shape == (6,)
+    assert t.shape == (5,)  # 5 ES-optimizable params
     assert t[0] == 0.5
 
     p2 = LMParam.from_tensor(t)
@@ -42,11 +42,11 @@ async def test_system_wiring():
     system.register_hyperfunction(fn1)
 
     # Check hp size
-    assert system.hp_dim == 6
+    assert system.hp_dim == 5  # 5 ES-optimizable params
     state = system.get_hp_state()
     assert set(state.keys()) == {"fn1"}
     hp = state["fn1"]
-    assert hp.shape == (6,)
+    assert hp.shape == (5,)
 
     # Initialize hp to something specific
     with torch.no_grad():

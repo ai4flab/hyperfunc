@@ -18,15 +18,20 @@ Table of contents
   - [Composition example: XOR](#composition-example-xor)
   - [Parallel execution](#parallel-execution)
   - [Primitives: combine and split](#primitives-combine-and-split)
+  - [LLM integration](#llm-integration)
+  - [Memory for CHAT agents](#memory-for-chat-agents)
+  - [Observability](#observability)
+  - [Evaluation Framework](#evaluation-framework)
 - [Background](#background)
   - [Motivation: why backprop is not enough](#motivation-why-backprop-is-not-enough)
   - [ES and Eggroll: tuning without backprop](#es-and-eggroll-tuning-without-backprop)
-  - [DSPy and GEPA: tuning prompts in compound systems](#dspy-and-gepa-tuning-prompts-in-compound-systems)
+  - [DSPy and Prompt Learning: tuning prompts in compound systems](#dspy-and-prompt-learning-tuning-prompts-in-compound-systems)
   - [How ES with low-rank noise works](#how-es-with-low-rank-noise-works)
 - [Advanced topics](#advanced-topics)
   - [Population evaluation and DAG staging](#population-evaluation-and-dag-staging)
   - [GPU batching with vmap](#gpu-batching-with-vmap)
-  - [Prompt optimisation with GEPA](#prompt-optimisation-with-gepa)
+  - [DSPy-style signatures](#dspy-style-signatures)
+  - [Prompt optimisation with Prompt Learning](#prompt-optimisation-with-prompt-learning)
   - [Ablations and sensitivity](#ablations-and-sensitivity)
   - [Caveats and limits](#caveats-and-limits)
 - [Testing and development](#testing-and-development)
@@ -171,8 +176,19 @@ The core pieces live in `hyperfunc`:
 - `LoRAWeight`: factory for creating 2D weight matrix hp_types with low-rank noise support.
 - `ESHybridSystemOptimizer`: ES-based optimiser with Eggroll-style low-rank noise for 2D params.
 - `TorchEggrollES`: lower-level ES trainer for nn.Module (used internally).
-- `GEPAPromptOptimizer`: GEPA-based prompt optimiser (experimental).
+- `PromptLearningOptimizer`: meta-prompting-based prompt optimiser with rich textual feedback.
+- `Signature`, `InputField`, `OutputField`: DSPy-style semantic task definitions.
+- `Predict`: create hyperfunctions from signatures.
 - `combine`, `split`: primitives for tensor operations that auto-trace in the DAG.
+- `llm_completion`: hyperfunction wrapping LiteLLM for 100+ LLM providers.
+- `make_llm_completion`: factory for model-specific LLM hyperfunctions.
+- `Memory`: SQLite/PostgreSQL-backed persistent memory for CHAT agents.
+- `AgentType`: enum for agent patterns (`FLOW`, `CHAT`, `GAME`).
+- `Scorer`, `ScoreResult`: evaluation framework with rich feedback.
+- `ExactMatch`, `NumericDistance`, `ContainsMatch`, etc.: built-in scorers.
+- `LLMJudge`: LLM-as-judge evaluation with structured feedback.
+- `NoOpSystemOptimizer`: disable ES for prompt-only optimization.
+- `OTLPExporter`: export traces to Jaeger, Grafana Tempo, or any OTLP backend.
 
 
 LoRA weights and 2D hyperparameters
@@ -354,6 +370,319 @@ These primitives:
 Using raw `torch.cat` or `torch.split` on traced values will trigger a warning, since they bypass the tracing system.
 
 
+LLM integration
+---------------
+
+Hyperfunc includes built-in LLM support via LiteLLM, with ES-optimizable parameters and automatic rate limiting.
+
+**Installation:**
+
+```bash
+pip install hyperfunc[llm]
+```
+
+**Basic usage:**
+
+```python
+from hyperfunc import llm_completion, LMParam
+
+# Direct call with explicit parameters
+response = await llm_completion(
+    model="gpt-4o-mini",
+    messages=[{"role": "user", "content": "Hello!"}],
+    temperature=0.7,
+)
+print(response.content)
+
+# With ES-optimizable LMParam
+hp = LMParam(temperature=0.5, top_p=0.9)
+response = await llm_completion(
+    model="anthropic/claude-3-haiku",
+    messages=[{"role": "user", "content": "Hello!"}],
+    hp=hp,
+)
+```
+
+**Factory pattern for model-specific functions:**
+
+```python
+from hyperfunc import make_llm_completion, HyperSystem
+
+# Create a model-specific hyperfunction
+gpt4 = make_llm_completion(
+    "gpt-4o",
+    system_prompt="You are a helpful assistant.",
+)
+
+class QASystem(HyperSystem):
+    async def run(self, question: str) -> str:
+        response = await gpt4(question)  # LMParam is ES-optimizable
+        return response.content
+
+# ES will optimize temperature, top_p, etc.
+await system.optimize(examples, metric_fn)
+```
+
+**Key features:**
+
+- Works with 100+ LLM providers via LiteLLM (OpenAI, Anthropic, Ollama, etc.)
+- `LMParam` has 5 ES-optimizable parameters: `temperature`, `top_p`, `presence_penalty`, `frequency_penalty`, `max_tokens_frac`
+- Automatic rate limiting (enabled by default, disable with `rate_limit=False`)
+- Streaming automatically disabled during `evaluate()` and `optimize()` to get full responses for metrics
+
+
+Memory for CHAT agents
+----------------------
+
+For conversational agents, Hyperfunc provides a persistent memory system with full-text search.
+
+**Basic usage:**
+
+```python
+from hyperfunc import Memory, MemoryEntry, MemoryType
+
+# SQLite (default, local)
+memory = Memory("chat.db")
+memory = Memory(":memory:")  # In-memory for testing
+
+# PostgreSQL (multi-tenant, shared)
+memory = Memory("postgresql://user:pass@localhost/mydb")
+```
+
+**Storing and retrieving memories:**
+
+```python
+# Store a conversation turn (auto-extracts facts, preferences, entities)
+await memory.store_turn(
+    user_message="I'm building a FastAPI project in Python",
+    assistant_response="Great! What features do you need?",
+    user_id="user123",  # Optional: for multi-tenant isolation
+)
+
+# Retrieve relevant memories using full-text search
+memories = memory.retrieve("FastAPI", user_id="user123")
+context = memory.format_context(memories)  # Format for prompt injection
+```
+
+**Integration with CHAT agents:**
+
+```python
+from hyperfunc import HyperSystem, AgentType, ChatResponse, Memory
+
+class ChatBot(HyperSystem):
+    agent_type = AgentType.CHAT
+
+    async def run(self, message, history=None, memory_context=None):
+        # memory_context is automatically injected when memory is enabled
+        prompt = f"{memory_context}\n\nUser: {message}" if memory_context else message
+        response = await self.llm(prompt)
+        return ChatResponse(message=response, done=False)
+
+# Create with memory
+memory = Memory("chat.db", extraction_model="gpt-4o-mini")
+bot = ChatBot(memory=memory)
+```
+
+**Key features:**
+
+- **SQLite FTS5** for local full-text search with BM25 ranking
+- **PostgreSQL TSVector** for shared database deployments
+- **Multi-tenant** via `user_id` field (isolate memories per user)
+- **Auto-extraction** of facts, preferences, entities from conversations
+- **Relevance scoring** combining text match, importance, and recency
+- Memory types: `FACT`, `PREFERENCE`, `CONTEXT`, `EVENT`, `ENTITY`
+
+**Installation for PostgreSQL:**
+
+```bash
+pip install hyperfunc[postgres]
+```
+
+
+Observability
+-------------
+
+Hyperfunc includes a built-in observability system that traces hyperfunction calls with OpenTelemetry GenAI semantic conventions.
+
+**Basic usage:**
+
+```python
+from hyperfunc import HyperSystem, hyperfunction
+
+class MySystem(HyperSystem):
+    async def run(self, x):
+        return await my_hyperfunction(x)
+
+system = MySystem()
+
+# Enable tracing with a context manager
+with system.observability.trace(session_id="my-session"):
+    result = await system.run(5)
+
+# Get call history as ObservationRecord objects
+history = system.observability.get_history()
+for obs in history:
+    print(f"{obs.fn_name}: {obs.elapsed_s:.3f}s")
+
+# Get summary with per-function statistics
+summary = system.observability.summary()
+print(summary.to_markdown())  # Formatted report
+```
+
+**Export to JSON:**
+
+```python
+# Export observations and summary to JSON
+system.observability.export_json("trace.json")
+
+# Or use JSONExporter for more control
+from hyperfunc import JSONExporter
+
+exporter = JSONExporter("trace.jsonl", jsonl=True, include_summary=False)
+exporter.export(history, summary)
+```
+
+**Export to OpenTelemetry (OTLP):**
+
+Export traces to any OTLP-compatible backend: Jaeger, Grafana Tempo, Honeycomb, etc.
+
+```bash
+# Install OTLP support
+pip install hyperfunc[otlp]       # gRPC (default, port 4317)
+pip install hyperfunc[otlp-http]  # HTTP/protobuf (port 4318)
+```
+
+```python
+# Export to Jaeger
+system.observability.export_otlp(endpoint="http://jaeger:4317")
+
+# Export to Grafana Tempo via HTTP
+system.observability.export_otlp(
+    endpoint="http://tempo:4318",
+    protocol="http",
+)
+
+# With custom service name and authentication
+system.observability.export_otlp(
+    endpoint="http://collector:4317",
+    service_name="my-ai-service",
+    headers={"Authorization": "Bearer token"},
+)
+
+# Or use OTLPExporter directly
+from hyperfunc import OTLPExporter
+
+exporter = OTLPExporter(
+    endpoint="http://localhost:4317",
+    service_name="hyperfunc-batch",
+)
+exporter.export(observations)
+exporter.shutdown()
+```
+
+The OTLP exporter maps hyperfunc's `ObservationRecord` to OpenTelemetry spans with:
+- **GenAI semantic conventions**: `gen_ai.system`, `gen_ai.request.model`, `gen_ai.usage.input_tokens`, etc.
+- **Error status**: Failed observations set `otel.status_code=ERROR` with exception details
+- **Custom metrics**: Extra metrics appear as `hyperfunc.*` attributes
+
+**LangFuse integration:**
+
+```python
+from hyperfunc import LangFuseExporter
+
+# Requires: pip install langfuse
+exporter = LangFuseExporter(trace_name="my-trace")
+system.observability.export(exporter)
+```
+
+**Key features:**
+
+- **GenAI semantic conventions** following OpenTelemetry standards (model, tokens, cost)
+- **Percentile latencies** (p50, p95, p99) per hyperfunction
+- **Error tracking** with error rates and messages
+- **Session management** with unique session IDs
+- **Multiple export formats**: JSON, JSONL, OTLP, LangFuse
+- **Markdown reports** via `summary.to_markdown()`
+
+
+Evaluation Framework
+--------------------
+
+Hyperfunc includes an evaluation framework with scorers that provide both numeric scores and rich textual feedback. This is particularly useful for `PromptLearningOptimizer`, where detailed feedback drives prompt improvement.
+
+**Built-in scorers:**
+
+```python
+from hyperfunc import ExactMatch, NumericDistance, ContainsMatch, RegexMatch, CompositeScorer
+
+# Exact string match (case-insensitive)
+scorer = ExactMatch(case_sensitive=False)
+result = scorer.score(output="Hello", expected="hello")
+# result.score = 1.0, result.feedback = ""
+
+# Numeric comparison with tolerance
+scorer = NumericDistance(tolerance=0.01)
+result = scorer.score(output=3.14, expected=3.14159)
+# result.score ≈ 0.99, result.feedback = "Off by 0.00159"
+
+# Substring match
+scorer = ContainsMatch()
+result = scorer.score(output="The answer is 42", expected="42")
+# result.score = 1.0
+
+# Composite scorer with weights
+scorer = CompositeScorer(scorers=[
+    (ExactMatch(), 2.0),      # 2x weight
+    (ContainsMatch(), 1.0),   # 1x weight
+])
+```
+
+**LLM-as-judge for complex evaluations:**
+
+```python
+from hyperfunc import LLMJudge, SummarizationJudge
+
+# Custom judge with criteria
+judge = LLMJudge(
+    model="gpt-4o-mini",
+    criteria="Evaluate the response for accuracy, completeness, and clarity.",
+    scale=(1, 5),
+)
+result = await judge.score(
+    output="Paris is the capital.",
+    expected="Paris is the capital of France.",
+    inputs={"question": "What is the capital of France?"}
+)
+# result.score = 0.75 (normalized from 4/5)
+# result.feedback = "Good answer but missing the country context..."
+
+# Pre-configured judges for common tasks
+summarization_judge = SummarizationJudge(model="gpt-4o-mini")
+code_judge = CodeCorrectnessJudge(model="gpt-4o-mini")
+```
+
+**Integration with PromptLearningOptimizer:**
+
+```python
+from hyperfunc import PromptLearningOptimizer, ExactMatch, LLMJudge
+
+# Use a Scorer for both metric AND feedback
+scorer = ExactMatch(case_sensitive=False)
+optimizer = PromptLearningOptimizer(
+    model="gpt-4o-mini",
+    scorer=scorer,  # Provides both score and feedback
+    max_iterations=3,
+)
+
+# Or use LLMJudge for richer feedback
+judge = LLMJudge(model="gpt-4o-mini", criteria="Evaluate classification accuracy")
+optimizer = PromptLearningOptimizer(scorer=judge)
+
+system = MySystem(prompt_optimizer=optimizer)
+await system.optimize(train_data, metric_fn)  # Uses scorer for feedback
+```
+
+
 Background
 ==========
 
@@ -405,15 +734,15 @@ Eggroll (from HyperscaleES) is a more efficient flavour of ES. It uses low-rank 
 This makes it more realistic to tune meaningful parameter vectors (hyperparameters, adapter weights, small heads) without backprop and without blowing up compute.
 
 
-DSPy and GEPA: tuning prompts in compound systems
---------------------------------------------------
+DSPy and Prompt Learning: tuning prompts in compound systems
+------------------------------------------------------------
 
 In parallel, there is a line of work that treats compound systems as programs whose main knobs are prompts:
 
 - DSPy lets you describe a pipeline as Python functions and automatically tune prompts ("teleprompting") using supervised data and metrics.
-- GEPA provides a generic prompt optimisation engine that mutates and reflects on prompts to improve performance.
+- Prompt Learning (Arize-style) uses meta-prompting with rich textual feedback to iteratively refine prompts.
 
-These tools focus on prompt text as the primary control surface. They usually assume the model weights and most hyperparameters stay fixed or are hand-tuned.
+Hyperfunc supports DSPy-style signatures for defining semantic input/output schemas, combined with Prompt Learning for optimization. Unlike evolutionary approaches that require many iterations, Prompt Learning typically converges in 1-3 iterations by using detailed feedback about failures.
 
 
 How ES with low-rank noise works
@@ -543,28 +872,91 @@ results = batched_fn(features, candidate_weights)  # (10, 5)
 | Speedup | Baseline | 10-100x for tensor ops |
 
 
-Prompt optimisation with GEPA
------------------------------
+DSPy-style signatures
+---------------------
 
-GEPA is a richer system for prompt search and reflection. Hyperfunc's `GEPAPromptOptimizer` is a thin adapter that:
-
-- exposes a single `HyperFunction` (and a metric) as a GEPA optimisation problem
-- lets GEPA mutate candidate prompts and evaluate them through your system
-
-At the moment:
-
-- `HyperSystem` defaults to a no-op prompt optimiser (`NoOpPromptOptimizer`).
-- If you want GEPA, you must pass it explicitly:
+Hyperfunc supports DSPy-style signatures for defining semantic LLM tasks with typed input/output fields:
 
 ```python
-from hyperfunc import HyperSystem, GEPAPromptOptimizer
+from hyperfunc import Signature, InputField, OutputField, Predict, HyperSystem
 
-system = MySystem(
-    prompt_optimizer=GEPAPromptOptimizer(model="gpt-4o"),
-)
+# Define a semantic signature
+class QA(Signature):
+    """Answer questions based on context."""
+    context: str = InputField(desc="Background information")
+    question: str = InputField(desc="Question to answer")
+    answer: str = OutputField(desc="Concise answer")
+
+# Create a hyperfunction from the signature
+qa = Predict(QA, model="gpt-4o")
+
+class QASystem(HyperSystem):
+    async def run(self, context: str, question: str) -> str:
+        result = await qa(context=context, question=question)
+        return result["answer"]
+
+# The signature's docstring becomes the optimizable prompt
+# PromptLearningOptimizer can refine it during optimization
 ```
 
-The GEPA integration is for experimentation. Expect to adjust it as the `gepa` package evolves.
+Key features:
+
+- `Signature`: base class with docstring as task instruction
+- `InputField(desc="...")`: defines input parameters with descriptions
+- `OutputField(desc="...")`: defines expected outputs
+- `Predict(signature, model)`: creates an ES-optimizable hyperfunction
+- Both `optimize_prompt=True` and `optimize_hparams=True` are enabled by default
+
+
+Prompt optimisation with Prompt Learning
+----------------------------------------
+
+Hyperfunc uses Arize-style Prompt Learning for prompt optimization. Unlike evolutionary approaches (like GEPA) that require many iterations, Prompt Learning uses meta-prompting with rich textual feedback to converge quickly (typically 1-3 iterations).
+
+**How it works:**
+
+1. Run the system on training data
+2. Collect rich textual feedback explaining failures (not just scalar metrics)
+3. Use an LLM to generate an improved prompt based on the feedback
+4. Accept the new prompt if it improves the metric
+
+**Default behavior:**
+
+`HyperSystem` uses `PromptLearningOptimizer` by default for any hyperfunctions with `optimize_prompt=True`.
+
+```python
+from hyperfunc import HyperSystem, PromptLearningOptimizer
+
+# Default: PromptLearningOptimizer is used automatically
+system = MySystem()
+
+# Or configure explicitly:
+system = MySystem(
+    prompt_optimizer=PromptLearningOptimizer(
+        model="gpt-4o",       # Model for meta-prompting
+        max_iterations=3,     # Usually converges in 1-3
+        verbose=True,         # Print progress
+    )
+)
+
+# Custom feedback function for domain-specific error explanations
+def feedback_fn(inputs, output, expected):
+    if len(output) > 100:
+        return f"Output too long ({len(output)} chars). Keep under 100."
+    if output != expected:
+        return f"Expected '{expected}' but got '{output}'"
+    return ""  # Empty = success
+
+await system.optimize(train_data, metric_fn, feedback_fn=feedback_fn)
+```
+
+**Disabling prompt optimization:**
+
+```python
+from hyperfunc import NoOpPromptOptimizer
+
+system = MySystem(prompt_optimizer=NoOpPromptOptimizer())
+```
 
 
 Ablations and sensitivity
@@ -636,6 +1028,12 @@ Key test files:
 - `tests/test_affine_composition.py` - Composed 2x2 matrices learning transforms
 - `tests/test_xor_composition.py` - XOR proving composition is required
 - `tests/test_primitives.py` - combine/split primitives and auto-tracing
+- `tests/test_signature.py` - DSPy-style signatures and Predict
+- `tests/test_llm.py` - LiteLLM integration and LMParam
+- `tests/test_eval.py` - Evaluation framework (Scorers, LLMJudge)
+- `tests/test_prompt_learning.py` - Real LLM prompt optimization tests
+- `tests/test_observability.py` - Tracing and export
+- `tests/test_otlp_integration.py` - OTLP export with Jaeger testcontainer (run with `-m integration`)
 
 
 Status
@@ -654,5 +1052,7 @@ The core pieces are stable enough for experiments:
 - Full async/await API for explicit parallelism
 - `vmap` infrastructure for GPU-batched population evaluation
 - Memory chunking for large candidate × example batches
+- DSPy-style `Signature`, `InputField`, `OutputField`, and `Predict` for semantic task definitions
+- `PromptLearningOptimizer` for meta-prompting-based prompt optimization
 
-The GEPA integration and higher-level tooling are intentionally thin so that you can adapt them to your own stack.
+The higher-level tooling is intentionally thin so that you can adapt it to your own stack.

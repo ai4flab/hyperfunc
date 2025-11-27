@@ -6,10 +6,38 @@ import time
 import warnings
 import weakref
 from dataclasses import dataclass, field
-from typing import Any, Callable, Coroutine, Dict, List, Optional, Protocol, Sequence, Set, Tuple, Type
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Coroutine,
+    Dict,
+    List,
+    Optional,
+    Protocol,
+    Sequence,
+    Set,
+    Tuple,
+    Type,
+    Union,
+)
 
 import torch
 from torch import nn
+
+from .agents import (
+    AgentType,
+    ChatResponse,
+    ConversationResult,
+    ConversationTurn,
+    EpisodeResult,
+    FlowResponse,
+    GameResponse,
+)
+
+if TYPE_CHECKING:
+    from .memory import Memory
+    from .observability import ObservabilityHub
 
 
 class TracedValueWarning(UserWarning):
@@ -430,32 +458,40 @@ def get_hp_default_init(hp_type: Optional[type]) -> Optional[torch.Tensor]:
 @dataclass
 class LMParam:
     """
-    Standard "LLM behavior" hyperparameters (1D, 6 scalars).
+    LLM hyperparameters compatible with LiteLLM completion API.
 
-    Interpretation convention:
+    ES-optimizable params (5 scalars):
+    - temperature: 0.0 - 2.0 (default 0.7)
+    - top_p: 0.0 - 1.0 (default 1.0)
+    - presence_penalty: -2.0 - 2.0 (default 0.0)
+    - frequency_penalty: -2.0 - 2.0 (default 0.0)
+    - max_tokens_frac: 0.0 - 1.0 (fraction of model max, default 0.25)
 
-    - temperature: 0.0 – 1.5
-    - top_p: 0.0 – 1.0
-    - top_k_norm: 0.0 – 1.0 (mapped to top_k in some range, e.g. [1, 1024])
-    - length_factor: 0.5 – 2.0 (scales max_tokens)
-    - repetition_penalty: 0.0 – 2.0 (1.0 = none)
-    - strictness: 0.0 – 1.0 (0 = relaxed, 1 = ultra strict about format)
+    Non-optimizable params (set directly):
+    - max_tokens: Override max_tokens_frac if set
+    - stop: List of stop sequences
+    - seed: Random seed for deterministic sampling
     """
 
-    temperature: float = 0.1
-    top_p: float = 0.9
-    top_k_norm: float = 1.0
-    length_factor: float = 1.0
-    repetition_penalty: float = 1.0
-    strictness: float = 1.0
+    # Core sampling params (ES-optimizable)
+    temperature: float = 0.7
+    top_p: float = 1.0
+    presence_penalty: float = 0.0
+    frequency_penalty: float = 0.0
+    max_tokens_frac: float = 0.25
+
+    # Non-optimizable params
+    max_tokens: Optional[int] = None
+    stop: Optional[List[str]] = None
+    seed: Optional[int] = None
 
     @classmethod
     def shape(cls) -> Tuple[int, ...]:
-        return (6,)
+        return (5,)  # Only continuous params
 
     @classmethod
     def dim(cls) -> int:
-        return 6
+        return 5
 
     @classmethod
     def noise_rank(cls) -> Optional[int]:
@@ -465,10 +501,9 @@ class LMParam:
         vals = [
             self.temperature,
             self.top_p,
-            self.top_k_norm,
-            self.length_factor,
-            self.repetition_penalty,
-            self.strictness,
+            self.presence_penalty,
+            self.frequency_penalty,
+            self.max_tokens_frac,
         ]
         return torch.tensor(vals, device=device, dtype=dtype)
 
@@ -479,11 +514,35 @@ class LMParam:
         return cls(
             temperature=float(t[0]),
             top_p=float(t[1]),
-            top_k_norm=float(t[2]),
-            length_factor=float(t[3]),
-            repetition_penalty=float(t[4]),
-            strictness=float(t[5]),
+            presence_penalty=float(t[2]),
+            frequency_penalty=float(t[3]),
+            max_tokens_frac=float(t[4]),
         )
+
+    def to_litellm_kwargs(self, model_max_tokens: int = 4096) -> Dict[str, Any]:
+        """Convert to kwargs for litellm.completion().
+
+        Values are clamped to valid API ranges:
+        - temperature: 0.0 to 2.0
+        - top_p: 0.0 to 1.0
+        - presence_penalty: -2.0 to 2.0
+        - frequency_penalty: -2.0 to 2.0
+        """
+        kwargs: Dict[str, Any] = {
+            "temperature": max(0.0, min(2.0, self.temperature)),
+            "top_p": max(0.0, min(1.0, self.top_p)),
+            "presence_penalty": max(-2.0, min(2.0, self.presence_penalty)),
+            "frequency_penalty": max(-2.0, min(2.0, self.frequency_penalty)),
+        }
+        if self.max_tokens is not None:
+            kwargs["max_tokens"] = self.max_tokens
+        else:
+            kwargs["max_tokens"] = max(1, int(self.max_tokens_frac * model_max_tokens))
+        if self.stop:
+            kwargs["stop"] = self.stop
+        if self.seed is not None:
+            kwargs["seed"] = self.seed
+        return kwargs
 
 
 # ============================================================
@@ -682,6 +741,13 @@ class HyperFunction:
         sig = inspect.signature(fn)
         self._sig = sig
 
+        # Detect VAR_KEYWORD parameter (e.g., **kwargs) for proper unpacking
+        self._var_keyword_name: Optional[str] = None
+        for name, p in sig.parameters.items():
+            if p.kind == inspect.Parameter.VAR_KEYWORD:
+                self._var_keyword_name = name
+                break
+
         self._hp_param_name: Optional[str] = None
         if hp_type is not None:
             for name, p in sig.parameters.items():
@@ -852,7 +918,12 @@ class HyperFunction:
                     )
 
                 # Call the underlying function - await if it's a coroutine
-                result = self.fn(**bound.arguments)
+                # Handle VAR_KEYWORD (**kwargs) properly: extract and merge
+                call_args = dict(bound.arguments)
+                if self._var_keyword_name and self._var_keyword_name in call_args:
+                    var_kwargs = call_args.pop(self._var_keyword_name)
+                    call_args.update(var_kwargs)
+                result = self.fn(**call_args)
                 if asyncio.iscoroutine(result):
                     result = await result
 
@@ -980,6 +1051,7 @@ class NoOpSystemOptimizer:
         system: "HyperSystem",
         train_data: Sequence[Example],
         metric_fn: Callable[[List[Any], List[Any]], float],
+        traces: Optional[List["ExecutionTrace"]] = None,
     ) -> None:
         return
 
@@ -1032,24 +1104,44 @@ class HyperSystem:
         system.optimize(train_data, metric_fn)
 
     After that, calling the HyperFunctions will use tuned prompts + tuned hp.
+
+    Agent Types:
+        The `agent_type` class attribute determines how `evaluate()` processes examples:
+        - FLOW (default): Single I/O - each Example is one input/output pair
+        - CHAT: Multi-turn - each Example is a full conversation
+        - GAME: RL-style - each Example is an episode configuration
+
+        Override at the class level:
+            class ChatBot(HyperSystem):
+                agent_type = AgentType.CHAT
+
+                async def run(self, message, history=None):
+                    response = await chat_hyperfunction(message, history)
+                    return ChatResponse(message=response, done="bye" in response)
     """
+
+    # Agent type determines evaluation pattern. Override in subclasses.
+    agent_type: AgentType = AgentType.FLOW
+
+    # Optional memory store for CHAT/GAME agents. Override in subclasses or set in __init__.
+    memory: Optional["Memory"] = None
 
     def __init__(
         self,
         prompt_optimizer: Optional[PromptOptimizer] = None,
         system_optimizer: Optional[SystemOptimizer] = None,
+        memory: Optional["Memory"] = None,
     ) -> None:
         # Registered HyperFunctions and their per-function hp blocks.
         self._hyperfunctions: Dict[str, HyperFunction] = {}
         # name -> 1D Parameter representing that HyperFunction's hp block.
         self._hp_params: Dict[str, nn.Parameter] = {}
 
-        # By default we use a no-op prompt optimizer to avoid
-        # taking a hard dependency on the external GEPA engine.
-        # Callers that want real prompt optimisation should pass
-        # an explicit GEPAPromptOptimizer instance.
+        # By default we use PromptLearningOptimizer for prompt optimization.
+        # Pass NoOpPromptOptimizer() to disable prompt optimization.
         if prompt_optimizer is None:
-            self.prompt_optimizer = NoOpPromptOptimizer()
+            from .prompt import PromptLearningOptimizer
+            self.prompt_optimizer = PromptLearningOptimizer()
         else:
             self.prompt_optimizer = prompt_optimizer
 
@@ -1078,6 +1170,47 @@ class HyperSystem:
             self._otel_tracer = None
         # name -> metric function over CallContext
         self.otel_metric_funcs: Dict[str, Callable[[CallContext], float]] = {}
+
+        # Memory store for CHAT/GAME agents
+        if memory is not None:
+            self.memory = memory
+
+        # Observability hub (lazy-initialized)
+        self._observability: Optional["ObservabilityHub"] = None
+
+    # ------------------------------------------------------------------
+    # Observability
+    # ------------------------------------------------------------------
+
+    @property
+    def observability(self) -> "ObservabilityHub":
+        """Get the observability hub for this system.
+
+        Provides tracing, metrics, and export functionality.
+
+        Usage:
+            # Enable tracing for a session
+            with system.observability.trace():
+                await system.run(...)
+
+            # Get history and summary
+            history = system.observability.get_history()
+            summary = system.observability.summary()
+
+            # Export
+            system.observability.export_json("trace.json")
+        """
+        if self._observability is None:
+            from .observability import ObservabilityHub
+            self._observability = ObservabilityHub(self)
+        return self._observability
+
+    def get_call_history(self) -> List[CallRecord]:
+        """Get the raw call history (requires tracing enabled).
+
+        For richer observability, use system.observability instead.
+        """
+        return list(self._call_history)
 
     # ------------------------------------------------------------------
     # HyperFunction registration and hp block management
@@ -1267,29 +1400,279 @@ class HyperSystem:
         """
         Evaluate the system on a batch of Examples with a metric.
 
-        - examples: list of Example(inputs, expected) where inputs are kwargs to run()
-        - metric_fn: (preds, expected) -> scalar score (higher is better)
+        The evaluation pattern depends on `self.agent_type`:
+        - FLOW: Each Example is a single I/O pair, run() called once
+        - CHAT: Each Example is a conversation, run() looped until done
+        - GAME: Each Example is an episode config, run() looped with environment
 
-        This runs each example through run() sequentially.
+        Args:
+            examples: List of Example(inputs, expected)
+                - FLOW: inputs are kwargs to run()
+                - CHAT: inputs["conversation"] is list of user messages
+                - GAME: inputs["env"], inputs["seed"], inputs["max_steps"]
+            metric_fn: (preds, expected) -> scalar score (higher is better)
+
+        Returns:
+            Aggregate score from metric_fn
         """
         global _CURRENT_SYSTEM
         prev_system = _CURRENT_SYSTEM
         _CURRENT_SYSTEM = self
+
+        # Set optimization context to disable streaming in LLM calls
+        from .llm import reset_optimization_context, set_optimization_context
+
+        opt_token = set_optimization_context(True)
 
         preds: List[Any] = []
         expected: List[Any] = []
         try:
             for ex in examples:
                 expected.append(ex.expected)
-                result = await self.run(**ex.inputs)
-                # Unwrap if traced
-                if isinstance(result, TracedValue):
-                    result = unwrap_traced(result)
+                result = await self._run_example(ex)
                 preds.append(result)
         finally:
             _CURRENT_SYSTEM = prev_system
+            reset_optimization_context(opt_token)
 
         return metric_fn(preds, expected)
+
+    async def _run_example(self, example: Example) -> Any:
+        """
+        Run one complete Example based on agent_type.
+
+        - FLOW: Single run() call
+        - CHAT: Loop run() for each turn in conversation
+        - GAME: Loop run() with environment until episode ends
+
+        Returns the result suitable for metric_fn comparison with example.expected.
+        """
+        if self.agent_type == AgentType.FLOW:
+            result = await self.run(**example.inputs)
+            # Unwrap if traced
+            if isinstance(result, TracedValue):
+                result = unwrap_traced(result)
+            # Unwrap FlowResponse if used
+            if isinstance(result, FlowResponse):
+                result = result.output
+            return result
+
+        elif self.agent_type == AgentType.CHAT:
+            return await self._run_conversation(example)
+
+        elif self.agent_type == AgentType.GAME:
+            return await self._run_episode(example)
+
+        else:
+            raise ValueError(f"Unknown agent_type: {self.agent_type}")
+
+    async def _run_conversation(self, example: Example) -> ConversationResult:
+        """
+        Run a full conversation for CHAT agent type.
+
+        Example.inputs should contain:
+            - "conversation": List of user messages (strings)
+            - Optional "max_turns": Maximum number of turns (default: 100)
+            - Optional "use_memory": Whether to use memory (default: True if memory is set)
+
+        The system's run() method should accept:
+            - message: The current user message
+            - history: List of previous turns (optional)
+            - memory_context: Retrieved memory context (optional, if memory is enabled)
+
+        And return ChatResponse(message=..., done=...).
+
+        Returns:
+            ConversationResult with full history and metadata.
+        """
+        conversation = example.inputs.get("conversation", [])
+        max_turns = example.inputs.get("max_turns", 100)
+        use_memory = example.inputs.get("use_memory", self.memory is not None)
+
+        history: List[ConversationTurn] = []
+        final_response: Optional[ChatResponse] = None
+
+        for i, user_msg in enumerate(conversation):
+            if i >= max_turns:
+                break
+
+            # Retrieve relevant memories if memory is enabled
+            memory_context = ""
+            if use_memory and self.memory is not None:
+                memories = self.memory.retrieve(user_msg)
+                memory_context = self.memory.format_context(memories)
+
+            # Call run() with message, history, and optional memory context
+            history_dicts = [{"role": t.role, "content": t.content} for t in history]
+            run_kwargs: Dict[str, Any] = {
+                "message": user_msg,
+                "history": history_dicts,
+            }
+            if memory_context:
+                run_kwargs["memory_context"] = memory_context
+
+            response = await self.run(**run_kwargs)
+
+            # Unwrap if traced
+            if isinstance(response, TracedValue):
+                response = unwrap_traced(response)
+
+            # Handle different response types
+            if isinstance(response, ChatResponse):
+                assistant_msg = response.message
+                done = response.done
+                final_response = response
+            elif isinstance(response, dict):
+                assistant_msg = response.get("message", str(response))
+                done = response.get("done", False)
+            elif isinstance(response, str):
+                assistant_msg = response
+                done = False
+            else:
+                assistant_msg = str(response)
+                done = False
+
+            # Store conversation turn in memory (async, fire-and-forget for performance)
+            if use_memory and self.memory is not None:
+                # Run memory storage in background to not block conversation
+                asyncio.create_task(
+                    self.memory.store_turn(user_msg, assistant_msg, extract=True)
+                )
+
+            # Record turns
+            history.append(ConversationTurn(role="user", content=user_msg))
+            history.append(ConversationTurn(role="assistant", content=assistant_msg))
+
+            if done:
+                break
+
+        return ConversationResult(
+            history=history,
+            turns=len(history) // 2,
+            done=final_response.done if final_response else False,
+            final_response=final_response,
+        )
+
+    async def _run_episode(self, example: Example) -> EpisodeResult:
+        """
+        Run a full episode for GAME agent type.
+
+        Example.inputs should contain:
+            - "env": Environment name or instance
+            - "seed": Optional random seed
+            - "max_steps": Maximum steps per episode (default: 1000)
+
+        The system's run() method should accept:
+            - observation: Current environment observation
+
+        And return GameResponse(action=...) or just the action.
+
+        Returns:
+            EpisodeResult with total reward, steps, and metadata.
+        """
+        env_spec = example.inputs.get("env")
+        seed = example.inputs.get("seed")
+        max_steps = example.inputs.get("max_steps", 1000)
+
+        # Create/get environment
+        env = self._make_env(env_spec, seed)
+
+        # Reset environment
+        reset_result = env.reset(seed=seed) if seed else env.reset()
+        if isinstance(reset_result, tuple):
+            obs, info = reset_result
+        else:
+            obs = reset_result
+            info = {}
+
+        total_reward = 0.0
+        steps = 0
+        done = False
+        truncated = False
+
+        for _ in range(max_steps):
+            # Get action from system
+            response = await self.run(observation=obs)
+
+            # Unwrap if traced
+            if isinstance(response, TracedValue):
+                response = unwrap_traced(response)
+
+            # Extract action
+            if isinstance(response, GameResponse):
+                action = response.action
+            elif isinstance(response, dict):
+                action = response.get("action", response)
+            else:
+                action = response
+
+            # Step environment
+            step_result = env.step(action)
+            if len(step_result) == 5:
+                obs, reward, terminated, truncated, info = step_result
+                done = terminated
+            else:
+                obs, reward, done, info = step_result
+                truncated = False
+
+            total_reward += reward
+            steps += 1
+
+            if done or truncated:
+                break
+
+        return EpisodeResult(
+            total_reward=total_reward,
+            steps=steps,
+            done=done,
+            truncated=truncated,
+            final_observation=obs,
+            info=info,
+        )
+
+    def _make_env(self, env_spec: Any, seed: Optional[int] = None) -> Any:
+        """
+        Create or return an environment for GAME agent type.
+
+        Override this method to customize environment creation.
+
+        Args:
+            env_spec: Environment specification (string name, instance, or callable)
+            seed: Optional random seed
+
+        Returns:
+            Environment instance with reset() and step() methods.
+        """
+        if env_spec is None:
+            raise ValueError("GAME agent requires 'env' in Example.inputs")
+
+        # If it's already an environment instance, return it
+        if hasattr(env_spec, "reset") and hasattr(env_spec, "step"):
+            return env_spec
+
+        # If it's a string, try to create via gymnasium
+        if isinstance(env_spec, str):
+            try:
+                import gymnasium as gym
+                return gym.make(env_spec)
+            except ImportError:
+                try:
+                    import gym
+                    return gym.make(env_spec)
+                except ImportError:
+                    raise ImportError(
+                        "GAME agent type requires 'gymnasium' or 'gym' package. "
+                        "Install with: pip install gymnasium"
+                    )
+
+        # If it's callable, call it to create the environment
+        if callable(env_spec):
+            return env_spec()
+
+        raise ValueError(
+            f"Cannot create environment from: {env_spec}. "
+            "Provide a string name, environment instance, or callable."
+        )
 
     async def build_traces(
         self,
@@ -1522,6 +1905,11 @@ class HyperSystem:
         prev_system = _CURRENT_SYSTEM
         _CURRENT_SYSTEM = self
 
+        # Set optimization context to disable streaming in LLM calls
+        from .llm import reset_optimization_context, set_optimization_context
+
+        opt_token = set_optimization_context(True)
+
         base_state = self.get_hp_state()
         results: List[float] = []
         expected: List[Any] = [ex.expected for ex in examples]
@@ -1548,6 +1936,7 @@ class HyperSystem:
 
         finally:
             _CURRENT_SYSTEM = prev_system
+            reset_optimization_context(opt_token)
 
         return results
 
