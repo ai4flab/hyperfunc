@@ -1920,12 +1920,10 @@ class HyperSystem:
                 self.set_hp_state(cand_state)
 
                 # Run all examples with this candidate's weights
+                # Use _run_example to properly handle FLOW/CHAT/GAME agent types
                 preds: List[Any] = []
                 for ex in examples:
-                    result = await self.run(**ex.inputs)
-                    # Unwrap if traced
-                    if isinstance(result, TracedValue):
-                        result = unwrap_traced(result)
+                    result = await self._run_example(ex)
                     preds.append(result)
 
                 # Compute metric for this candidate
@@ -2068,12 +2066,15 @@ class HyperSystem:
         Optimize the system on training data.
 
         1. Build traces by running each example once (captures DAG structure)
+           - For GAME agents, tracing is skipped (episodes have dynamic control flow)
         2. Run prompt optimization (if enabled)
         3. Run hyperparameter optimization using staged batch execution
         """
-        # 0) Build traces for staged execution
-        traces = await self.build_traces(train_data)
-        self._cached_trace = traces[0] if traces else None  # Cache first for reference
+        # 0) Build traces for staged execution (skip for GAME agents)
+        traces: Optional[List[ExecutionTrace]] = None
+        if self.agent_type == AgentType.FLOW:
+            traces = await self.build_traces(train_data)
+            self._cached_trace = traces[0] if traces else None
 
         # 1) Prompt optimisation
         if self.prompt_optimizer is not None:

@@ -63,6 +63,7 @@ Table of contents
   - [Ablations and sensitivity](#ablations-and-sensitivity)
   - [Caveats and limits](#caveats-and-limits)
 - [Testing and development](#testing-and-development)
+- [Demos](#demos)
 - [Status](#status)
 
 
@@ -1062,6 +1063,77 @@ Key test files:
 - `tests/test_prompt_learning.py` - Real LLM prompt optimization tests
 - `tests/test_observability.py` - Tracing and export
 - `tests/test_otlp_integration.py` - OTLP export with Jaeger testcontainer (run with `-m integration`)
+
+
+Demos
+-----
+
+Hyperfunc includes interactive Gradio demos that showcase different agent types. Install the demos extra to run them:
+
+```bash
+pip install hyperfunc[demos]
+# or with uv
+uv sync --extra demos
+```
+
+### Chat Agent Demo
+
+A conversational chatbot demonstrating `AgentType.CHAT` with multi-turn conversations.
+
+```bash
+uv run --extra demos python demos/chat_agent/app.py
+```
+
+**Features:**
+- Interactive chat interface using Gradio's ChatInterface
+- Demonstrates `ChatResponse` with message and done flag
+- History accumulation across conversation turns
+- ES-optimizable `LMParam` for response generation parameters
+
+### Game Agent Demo
+
+A GridWorld navigation game demonstrating `AgentType.GAME` with RL-style episodes and ES optimization.
+
+```bash
+uv run --extra demos python demos/game_agent/app.py
+```
+
+**Features:**
+- Visual 5x5 grid with emoji rendering (🤖 agent, 🎯 goal, 👣 path)
+- **Manual control**: Arrow buttons to play yourself
+- **AI agent**: Watch the trained policy navigate to the goal
+- **Live ES training**: Train the MLP policy in the browser and see improvement
+
+**The Game Agent demonstrates:**
+- `AgentType.GAME` for RL-style episode execution
+- `GameResponse` with action selection
+- MLP policy (2-layer neural network) packed into `LoRAWeight`
+- `ESHybridSystemOptimizer` training without backpropagation
+- `system.optimize()` API for end-to-end optimization
+
+**Architecture:**
+```python
+# MLP policy: 5 inputs -> 8 hidden (ReLU) -> 4 action logits
+# 108 parameters packed into a 12x9 LoRAWeight matrix
+PolicyWeights = LoRAWeight.create(out_dim=12, in_dim=9, noise_rank=4)
+
+@hyperfunction(hp_type=PolicyWeights, optimize_hparams=True)
+async def select_action(observation: Dict[str, Any], hp) -> int:
+    # Unpack weights and run forward pass
+    W1, b1 = hp.weight[:8, :5], hp.weight[:8, 5]
+    W2, b2 = hp.weight[8:12, :8], hp.weight[8:12, 8]
+
+    hidden = torch.relu(features @ W1.T + b1)
+    logits = hidden @ W2.T + b2
+    return int(logits.argmax().item())
+```
+
+**Training flow:**
+1. Start with random weights (agent moves randomly)
+2. Click "Train Agent" to run ES optimization
+3. ES evaluates population of weight perturbations on episodes
+4. Weights that lead to higher rewards are kept
+5. After training, agent navigates efficiently to the goal
 
 
 Status
