@@ -1,14 +1,41 @@
 hyperfunc
 =========
 
+[![PyPI version](https://badge.fury.io/py/hyperfunc.svg)](https://pypi.org/project/hyperfunc/)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+
 Hyperfunc is a small library for training compound AI systems, not just individual models.
 
 Most ML tooling assumes you can backpropagate gradients through the whole stack. In practice, real systems look very different: they are graphs of model calls, tools, databases, and control flow. Large parts of that graph are not differentiable and often not even visible (closed-source APIs, external services). You still want those pieces to get better from data, but you cannot run standard backprop through them.
 
 
+Installation
+------------
+
+```bash
+pip install hyperfunc
+```
+
+With optional dependencies:
+
+```bash
+pip install hyperfunc[llm]       # LiteLLM for 100+ LLM providers
+pip install hyperfunc[otlp]      # OpenTelemetry export (gRPC)
+pip install hyperfunc[otlp-http] # OpenTelemetry export (HTTP)
+pip install hyperfunc[postgres]  # PostgreSQL memory backend
+```
+
+Or install multiple extras:
+
+```bash
+pip install hyperfunc[llm,otlp,postgres]
+```
+
+
 Table of contents
 -----------------
 
+- [Installation](#installation)
 - [Quick start](#quick-start)
 - [What you can do with Hyperfunc](#what-you-can-do-with-hyperfunc)
 - [Core concepts](#core-concepts)
